@@ -2,13 +2,13 @@
 
 import re
 
-SEER = {
-    "annotation_path": "data/seer_sample.json",
+EVIALIGN = {
+    "annotation_path": "data/evialign_sample.json",
     "data_path": "data",
 }
 
 data_dict = {
-    "seer": SEER,
+    "evialign": EVIALIGN,
 }
 
 
@@ -34,7 +34,7 @@ def data_list(dataset_names):
 
 
 if __name__ == "__main__":
-    dataset_names = ["seer"]
+    dataset_names = ["evialign"]
     configs = data_list(dataset_names)
     for config in configs:
         print(config)
