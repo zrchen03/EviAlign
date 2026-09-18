@@ -1,4 +1,4 @@
-# SEER: Structured Evidence-slot Embeddings for Multimodal Retrieval
+# Learning Multimodal Embeddings With Evidence-Aligned Readout
 
 ## Installation
 
@@ -20,4 +20,4 @@ Multi-node (run on every node, change only `NODE_RANK`):
 MASTER_ADDR=<master_ip> MASTER_PORT=8005 NNODES=4 NODE_RANK=0 NPROC_PER_NODE=8 bash scripts/train.sh
 ```
 
-Checkpoints are saved to `./output/seer/`.
+Checkpoints are saved to `./output/evialign/`.
