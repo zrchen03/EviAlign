@@ -22,10 +22,10 @@ grad_accum_steps=2
 entry_file=qwenvl/train/train_qwen.py
 
 # Dataset configuration
-datasets=seer
+datasets=evialign
 
 # Output configuration
-run_name="seer"
+run_name="evialign"
 output_dir=./output/${run_name}
 
 # Training arguments
