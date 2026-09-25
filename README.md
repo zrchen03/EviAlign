@@ -1,18 +1,20 @@
 # EviAlign: Learning Multimodal Embeddings with Evidence-Aligned Readout
 
-EviAlign builds a single retrieval embedding from generated, task-relevant evidence. The model organizes evidence into five units—Entity, Attribute, Relation, Detail, and Summary—and reads the hidden state at each unit's closing token. The five states are averaged and normalized into one vector, so retrieval uses a standard single-vector index.
+EviAlign turns generated retrieval evidence into a single embedding. A shared multimodal model organizes evidence into five semantic units, reads the contextualized state at each unit's closing token, and averages and normalizes those states for standard single-vector retrieval.
 
-This repository provides a training-code example and an 800-pair sample illustrating the input and evidence-target format. The sample is not the full training set used for the paper's results.
+`Multimodal input → five evidence units → boundary states → one retrieval vector`
+
+This repository provides a reference training pipeline and representative evidence-annotation examples.
 
 ## Repository contents
 
 | Path | Contents |
 | --- | --- |
-| `qwenvl/train/` | Qwen-VL model loading, five-token readout, and joint training logic |
-| `qwenvl/data/` | Paired query–candidate data loading and multimodal preprocessing |
-| `scripts/train.sh` | Distributed training entry point and example hyperparameters |
-| `scripts/zero3.json` | DeepSpeed ZeRO-3 configuration used by the training script |
-| `data/evialign_sample.json` | 800 presentation-format query–candidate pairs from eight retrieval tasks |
+| [`qwenvl/train/`](qwenvl/train/) | Model loading, five-token readout, and joint training logic |
+| [`qwenvl/data/`](qwenvl/data/) | Paired query–candidate data loading and multimodal preprocessing |
+| [`scripts/train.sh`](scripts/train.sh) | Distributed training launcher |
+| [`scripts/zero3.json`](scripts/zero3.json) | DeepSpeed ZeRO-3 configuration |
+| [`data/evialign_sample.json`](data/evialign_sample.json) | Representative query–candidate evidence annotations |
 
 ## Evidence format
 
@@ -28,19 +30,21 @@ Each side of a training pair contains a multimodal input and an assistant target
 
 The bracketed labels identify the evidence units for readers. The five angle-bracketed markers are special model tokens. The training code registers these tokens, supervises their generation along with the evidence text, and uses their final-layer hidden states for the retrieval embedding.
 
-Each record in `data/evialign_sample.json` has a `dataset_name`, a `qry` object, and a `pos` object. Both sides contain `conversations` with a `human` input and a `gpt` evidence target; image-bearing examples also have an `image` path relative to `data/`. The included `data/blank.jpg` is used by examples whose input side has no actual image.
+## Example annotations
 
-The JSON file is a **presentation-format sample**, not a byte-for-byte export of the original training targets. Its field labels and line layout follow the paper. It does not include the MMEB image assets referenced by its relative paths.
+`data/evialign_sample.json` contains representative query–candidate examples. Each record has a `dataset_name`, a `qry` object, and a `pos` object. Both sides contain `conversations` with a `human` input and a `gpt` evidence target; image-bearing examples also include an `image` path relative to `data/`. The included `data/blank.jpg` is used when an input side has no actual image.
+
+The examples follow the paper's five-field presentation format. The reported experiments use approximately 500K query–candidate training pairs.
 
 ## Setup
 
-The provided launcher expects Linux, NVIDIA CUDA GPUs, `nvidia-smi`, and access to the Qwen3-VL-8B-Instruct model. Install the listed Python dependencies in a suitable CUDA environment:
+The training launcher expects Linux, NVIDIA CUDA GPUs, `nvidia-smi`, and access to Qwen3-VL-8B-Instruct. Install the Python dependencies in a suitable CUDA environment:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Before training, place the corresponding MMEB images under `data/mmeb_v1/` so that the relative `image` paths in the JSON resolve. If using a different annotation file or image root, update the `EVIALIGN` entry in `qwenvl/data/__init__.py`. Check that all referenced image files exist before launching a distributed job.
+Place the corresponding MMEB images under `data/mmeb_v1/` so that the relative `image` paths resolve. For a different annotation file or image root, update the `EVIALIGN` entry in `qwenvl/data/__init__.py`.
 
 ## Training
 
@@ -56,6 +60,16 @@ For multiple nodes, run the same command on each node with a shared master addre
 MASTER_ADDR=<master_ip> MASTER_PORT=8005 NNODES=4 NODE_RANK=0 NPROC_PER_NODE=8 bash scripts/train.sh
 ```
 
-The example launcher selects `Qwen/Qwen3-VL-8B-Instruct`, BF16, DeepSpeed ZeRO-3, a per-device batch size of 4, gradient accumulation of 2, one epoch, and five evidence tokens. Checkpoints are written to `output/evialign/`. Adjust the model path, distributed settings, and training parameters in `scripts/train.sh` for your environment.
+The example launcher uses these settings:
 
-Running the launcher on the 800-pair sample checks the training pipeline, but does not reproduce the paper's results, which use approximately 500K query–candidate training pairs. The full evidence annotations, MMEB image assets, trained checkpoints, and evaluation scripts are not part of this example release.
+| Setting | Value |
+| --- | --- |
+| Backbone | `Qwen/Qwen3-VL-8B-Instruct` |
+| Precision | BF16 |
+| Distributed training | DeepSpeed ZeRO-3 |
+| Batch size per device | 4 |
+| Gradient accumulation | 2 |
+| Epochs | 1 |
+| Evidence boundary tokens | 5 |
+
+Checkpoints are written to `output/evialign/`. Adjust the model path, distributed settings, and training parameters in [`scripts/train.sh`](scripts/train.sh) for your environment.
