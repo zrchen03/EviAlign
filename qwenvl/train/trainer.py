@@ -66,98 +66,6 @@ except ImportError:
 
 GEN_EMB_ID = 151669
 
-# Memory queue configuration
-MEMORY_QUEUE_SIZE = 512
-
-
-class MemoryQueue:
-    """
-    FIFO feature queue for storing historical batch features as additional negatives.
-    Supports distributed training: features are gathered across GPUs before enqueuing.
-    """
-
-    def __init__(self, feature_dim: int, queue_size: int = 256, device: str = 'cuda'):
-        self.queue_size = queue_size
-        self.feature_dim = feature_dim
-        self.device = device
-
-        # Queue is lazily initialized on first enqueue
-        self.queue = None
-        self.ptr = 0          # current write position
-        self.is_full = False  # whether the queue is full
-
-    def _init_queue(self, device, dtype=torch.float32):
-        """Lazy-initialize the queue."""
-        if self.queue is None:
-            self.queue = torch.zeros(self.queue_size, self.feature_dim, device=device, dtype=dtype)
-            self.device = device
-            self.dtype = dtype
-
-    @torch.no_grad()
-    def enqueue(self, features: torch.Tensor):
-        """
-        Enqueue features (FIFO).
-
-        Args:
-            features: [batch_size, feature_dim] tensor (should be detached)
-        """
-        # Lazy-initialize using the same dtype as input features
-        self._init_queue(features.device, features.dtype)
-
-        # Gather features across GPUs so all queues stay in sync
-        if dist.is_initialized():
-            world_size = dist.get_world_size()
-            gathered_features = [torch.zeros_like(features) for _ in range(world_size)]
-            dist.all_gather(gathered_features, features.contiguous())
-            features = torch.cat(gathered_features, dim=0)
-
-        batch_size = features.shape[0]
-
-        # If batch is larger than queue, keep only the latest queue_size entries
-        if batch_size > self.queue_size:
-            features = features[-self.queue_size:]
-            batch_size = self.queue_size
-
-        # Write into the queue
-        if self.ptr + batch_size <= self.queue_size:
-            self.queue[self.ptr:self.ptr + batch_size] = features
-        else:
-            # Wrap around to the beginning (FIFO)
-            overflow = (self.ptr + batch_size) - self.queue_size
-            self.queue[self.ptr:] = features[:batch_size - overflow]
-            self.queue[:overflow] = features[batch_size - overflow:]
-            self.is_full = True
-
-        self.ptr = (self.ptr + batch_size) % self.queue_size
-
-        # Mark as full once the queue wraps
-        if self.ptr == 0 and batch_size > 0:
-            self.is_full = True
-
-    def get_queue(self) -> Optional[torch.Tensor]:
-        """
-        Return valid features from the queue.
-
-        Returns:
-            Tensor of shape [valid_size, feature_dim], or None if empty.
-        """
-        if self.queue is None:
-            return None
-
-        if self.is_full:
-            return self.queue.clone()
-        elif self.ptr > 0:
-            # Queue not yet full; return only the filled portion
-            return self.queue[:self.ptr].clone()
-        else:
-            return None
-
-    def __len__(self):
-        """Return the number of valid features in the queue."""
-        if self.queue is None:
-            return 0
-        return self.queue_size if self.is_full else self.ptr
-
 
 def _flash_attention_forward(
     query_states: torch.Tensor,
@@ -782,11 +690,8 @@ def gather_features(
     return all_query_features, all_target_features
 
 
-class ClipLossWithMemory(nn.Module):
-    """
-    Contrastive loss with memory queue. Same interface as a standard CLIP loss but augments
-    both query and target sides with historical features from the memory queue as additional negatives.
-    """
+class ClipLoss(nn.Module):
+    """Symmetric query–candidate contrastive loss over the current batch."""
 
     def __init__(
             self,
@@ -805,7 +710,6 @@ class ClipLossWithMemory(nn.Module):
         self.world_size = world_size
         self.use_horovod = use_horovod
 
-        # cache state
         self.prev_num_logits = 0
         self.labels = {}
 
@@ -821,83 +725,34 @@ class ClipLossWithMemory(nn.Module):
             labels = self.labels[device]
         return labels
 
-    def get_logits(self, query_features, target_features, query_memory_features, target_memory_features, logit_scale):
-        """
-        Compute logits for both directions, augmenting each side with its memory queue features.
-
-        Args:
-            query_features: current batch query features
-            target_features: current batch target (positive) features
-            query_memory_features: historical query features (used for target→query direction)
-            target_memory_features: historical target features (used for query→target direction)
-            logit_scale: temperature scaling factor
-        """
+    def get_logits(self, query_features, target_features, logit_scale):
         if self.world_size > 1:
             all_query_features, all_target_features = gather_features(
                 query_features, target_features,
                 self.local_loss, self.gather_with_grad, self.rank, self.world_size, self.use_horovod)
-
-            # Concatenate memory features (symmetric dual-queue)
-            if target_memory_features is not None and target_memory_features.shape[0] > 0:
-                target_memory_features = target_memory_features.to(all_target_features.dtype)
-                all_target_features_with_memory = torch.cat([all_target_features, target_memory_features], dim=0)
-            else:
-                all_target_features_with_memory = all_target_features
-
-            if query_memory_features is not None and query_memory_features.shape[0] > 0:
-                query_memory_features = query_memory_features.to(all_query_features.dtype)
-                all_query_features_with_memory = torch.cat([all_query_features, query_memory_features], dim=0)
-            else:
-                all_query_features_with_memory = all_query_features
-
             if self.local_loss:
-                logits_per_query = logit_scale * query_features @ all_target_features_with_memory.T
-                logits_per_target = logit_scale * target_features @ all_query_features_with_memory.T
+                query_rows = query_features
+                target_rows = target_features
             else:
-                logits_per_query = logit_scale * all_query_features @ all_target_features_with_memory.T
-                logits_per_target = logit_scale * all_target_features @ all_query_features_with_memory.T
+                query_rows = all_query_features
+                target_rows = all_target_features
+            logits_per_query = logit_scale * query_rows @ all_target_features.T
+            logits_per_target = logit_scale * target_rows @ all_query_features.T
         else:
-            # Single-GPU case
-            if target_memory_features is not None and target_memory_features.shape[0] > 0:
-                target_memory_features = target_memory_features.to(target_features.dtype)
-                target_features_with_memory = torch.cat([target_features, target_memory_features], dim=0)
-            else:
-                target_features_with_memory = target_features
-
-            if query_memory_features is not None and query_memory_features.shape[0] > 0:
-                query_memory_features = query_memory_features.to(query_features.dtype)
-                query_features_with_memory = torch.cat([query_features, query_memory_features], dim=0)
-            else:
-                query_features_with_memory = query_features
-
-            logits_per_query = logit_scale * query_features @ target_features_with_memory.T
-            logits_per_target = logit_scale * target_features @ query_features_with_memory.T
+            logits_per_query = logit_scale * query_features @ target_features.T
+            logits_per_target = logit_scale * target_features @ query_features.T
 
         return logits_per_query, logits_per_target
 
-    def forward(self, query_features, target_features, query_memory_features=None, target_memory_features=None, logit_scale=50.0, output_dict=False):
-        """
-        Compute symmetric contrastive loss, augmented with memory queue negatives.
-
-        Args:
-            query_features: [N, dim] current batch query features
-            target_features: [N, dim] current batch positive (target) features
-            query_memory_features: [M, dim] historical query features (for target→query direction)
-            target_memory_features: [M, dim] historical target features (for query→target direction)
-            logit_scale: temperature scaling factor
-            output_dict: if True, return a dict; otherwise return a scalar
-        """
-        device = query_features.device
+    def forward(self, query_features, target_features, logit_scale=50.0, output_dict=False):
+        """Average the cross-entropy losses in both retrieval directions."""
         logits_per_query, logits_per_target = self.get_logits(
-            query_features, target_features, query_memory_features, target_memory_features, logit_scale)
-
-        labels = self.get_ground_truth(device, logits_per_query.shape[0])
-
+            query_features, target_features, logit_scale)
+        labels = self.get_ground_truth(query_features.device, logits_per_query.shape[0])
         total_loss = (
             F.cross_entropy(logits_per_query, labels) +
             F.cross_entropy(logits_per_target, labels)
         ) / 2
-
         return {"contrastive_loss": total_loss} if output_dict else total_loss
 
 
@@ -949,15 +804,8 @@ def forward(
     rank = torch.distributed.get_rank(group=None)
     world_size = torch.distributed.get_world_size(group=None)
 
-    # Gen loss with memory queue (symmetric dual-queue)
-    gen_qry_memory_features = None
-    gen_pos_memory_features = None
-    if hasattr(self, 'gen_qry_memory_queue') and self.gen_qry_memory_queue is not None:
-        gen_qry_memory_features = self.gen_qry_memory_queue.get_queue()
-    if hasattr(self, 'gen_pos_memory_queue') and self.gen_pos_memory_queue is not None:
-        gen_pos_memory_features = self.gen_pos_memory_queue.get_queue()
-
-    gen_loss_fct = ClipLossWithMemory(
+    # Symmetric contrastive loss over the current distributed batch.
+    gen_loss_fct = ClipLoss(
         local_loss=True,
         gather_with_grad=True,
         cache_labels=False,
@@ -968,16 +816,8 @@ def forward(
     gen_contrastive_loss = gen_loss_fct(
         gen_qry_reps,
         gen_pos_reps,
-        query_memory_features=gen_qry_memory_features,
-        target_memory_features=gen_pos_memory_features,
         logit_scale=50
     )
-
-    # Update memory queues
-    if hasattr(self, 'gen_qry_memory_queue') and self.gen_qry_memory_queue is not None:
-        self.gen_qry_memory_queue.enqueue(gen_qry_reps.detach())
-    if hasattr(self, 'gen_pos_memory_queue') and self.gen_pos_memory_queue is not None:
-        self.gen_pos_memory_queue.enqueue(gen_pos_reps.detach())
 
     contrastive_loss = gen_contrastive_loss
     loss = contrastive_loss + qry_output.loss + pos_output.loss

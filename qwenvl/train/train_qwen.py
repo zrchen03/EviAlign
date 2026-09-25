@@ -43,7 +43,7 @@ project_root = Path(__file__).parent.parent.parent
 sys.path.append(str(project_root))
 
 import qwenvl.train.trainer
-from trainer import replace_qwen2_vl_attention_class, MemoryQueue, MEMORY_QUEUE_SIZE
+from trainer import replace_qwen2_vl_attention_class
 
 from transformers import (
     Qwen2VLForConditionalGeneration,
@@ -197,19 +197,20 @@ def train(attn_implementation="flash_attention_2"):
 
     tokenizer.add_tokens(evidence_tokens)
     gen_emb_ids = [tokenizer.convert_tokens_to_ids(t) for t in evidence_tokens]
+    if len(tokenizer) > model.get_input_embeddings().num_embeddings:
+        model.resize_token_embeddings(len(tokenizer))
 
-    # Initialize new token embeddings from existing tokens
-    if "qwen3" in model_args.model_name_or_path.lower() or "qwen2.5" in model_args.model_name_or_path.lower():
-        right_tool_id = tokenizer.convert_tokens_to_ids("</tool_call>")
-    else:
-        right_tool_id = tokenizer.convert_tokens_to_ids("<|object_ref_end|>")
+    # Initialize the evidence-token embeddings from the model's EOS embedding.
+    eos_token_id = tokenizer.eos_token_id
+    if eos_token_id is None:
+        raise ValueError("The tokenizer must define an EOS token to initialize evidence tokens")
 
     embedding_weight = model.get_input_embeddings().weight
     with GatheredParameters([embedding_weight], modifier_rank=0):
         if torch.distributed.get_rank() == 0:
             with torch.no_grad():
                 for gid in gen_emb_ids:
-                    embedding_weight[gid] = embedding_weight[right_tool_id].clone()
+                    embedding_weight[gid] = embedding_weight[eos_token_id].clone()
 
     print(f"Evidence embedding token ids: {gen_emb_ids} (num_gen_tokens={num_gen_tokens}, tokens={evidence_tokens})")
 
@@ -217,12 +218,6 @@ def train(attn_implementation="flash_attention_2"):
     processor.tokenizer = tokenizer
 
     set_model(model_args, model)
-
-    # Save hidden_size for memory queue initialization
-    if hasattr(model.config, 'text_config'):
-        feature_dim = model.config.text_config.hidden_size
-    else:
-        feature_dim = model.config.hidden_size
 
     if model_args.use_lora:
         lora_config = LoraConfig(
@@ -247,24 +242,9 @@ def train(attn_implementation="flash_attention_2"):
             f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}"
         )
 
-    # Initialize Memory Queues (query and positive sides, symmetric)
-    gen_qry_memory_queue = MemoryQueue(
-        feature_dim=feature_dim,
-        queue_size=MEMORY_QUEUE_SIZE,
-        device='cuda'
-    )
-    gen_pos_memory_queue = MemoryQueue(
-        feature_dim=feature_dim,
-        queue_size=MEMORY_QUEUE_SIZE,
-        device='cuda'
-    )
-
-    # Attach memory queues and token IDs to model
-    model.gen_qry_memory_queue = gen_qry_memory_queue
-    model.gen_pos_memory_queue = gen_pos_memory_queue
+    # Attach evidence-token IDs to the model for boundary readout.
     model.gen_emb_ids = gen_emb_ids
 
-    rank0_print(f"[Memory] Initialized gen memory queues (qry & pos) with size={MEMORY_QUEUE_SIZE}, feature_dim={feature_dim}")
     rank0_print(f"[Tokens] gen_emb_ids={gen_emb_ids}")
 
     training_args.gradient_checkpointing_kwargs = {'use_reentrant':False}
