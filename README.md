@@ -21,3 +21,5 @@ MASTER_ADDR=<master_ip> MASTER_PORT=8005 NNODES=4 NODE_RANK=0 NPROC_PER_NODE=8 b
 ```
 
 Checkpoints are saved to `./output/evialign/`.
+
+`data/evialign_sample.json` contains presentation-format examples of the five evidence fields. Its field labels and line layout follow the paper and are not a byte-for-byte export of the original training targets.
